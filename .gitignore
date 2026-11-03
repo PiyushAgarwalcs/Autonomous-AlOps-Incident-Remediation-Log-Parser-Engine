@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Local logs and generated output
+*.log
+.pytest_cache/
+
+# OS/editor files
+.DS_Store
+Thumbs.db

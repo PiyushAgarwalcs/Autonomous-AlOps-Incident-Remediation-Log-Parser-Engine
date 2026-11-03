@@ -1,0 +1,1 @@
+{"timestamp":"2026-11-03T08:30:00Z","level":"ERROR","service":"payments-api","error_code":"DB_POOL_EXHAUSTED","message":"Database connection pool exhausted after 30 seconds"}
