@@ -1,7 +1,7 @@
 # 🛡️ Autonomous AIOps Incident Remediation & Log Parser Engine
 
 <p align="center">
-  <a href="https://autonomous-aiops-incident-remediation-log-parser-engine.streamlit.app"><img src="https://img.shields.io/badge/🚀%20Live%20Demo-Streamlit%20Cloud-FF4B4B?style=for-the-badge" alt="Live Demo"/></a>
+  <strong>🚀 Live Demo: <a href="https://autonomous-aiops-incident-remediation-log-parser-engine.streamlit.app">Open the app</a></strong>
 </p>
 
 <p align="center">
