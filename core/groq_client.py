@@ -94,8 +94,14 @@ class GroqClient:
         if not content:
             raise RuntimeError("Groq returned empty message content.")
 
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:].strip()
+
         try:
-            parsed = json.loads(content)
+            parsed = json.loads(cleaned)
         except json.JSONDecodeError as error:
             raise ValueError(f"Groq response was not valid JSON: {content}") from error
 

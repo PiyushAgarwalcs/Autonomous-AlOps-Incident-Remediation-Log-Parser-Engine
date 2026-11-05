@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 from fastapi import FastAPI, HTTPException
@@ -28,6 +29,7 @@ RUNBOOKS_FILE = Path("runbooks.jsonl")
 breaker = CircuitBreaker()
 vector_store = ChromaRunbooks(persist_dir="./chroma_db", collection_name="sre_runbooks")
 ollama = OllamaClient()
+groq = GroqClient(api_key=os.getenv("GROQ_API_KEY", ""))
 
 
 class LogPayload(BaseModel):
@@ -52,6 +54,7 @@ def health_check():
         "circuit_breaker": "OPEN (TRIPPED)" if breaker.is_open else "CLOSED (HEALTHY)",
         "circuit_breaker_reason": breaker.reason if breaker.is_open else None,
         "ollama_online": ollama.is_alive(),
+        "groq_configured": groq.is_configured(),
     }
 
 
@@ -134,10 +137,25 @@ def remediate_incident(payload: LogPayload):
     query = f"{event['error_code']} {event['service']} {event['message']}"
     runbooks = []
     if RUNBOOKS_FILE.exists():
-        try:
-            runbooks = vector_store.search(query, ollama, top_k=1)
-        except Exception:
-            runbooks = []
+        if ollama.is_alive():
+            try:
+                runbooks = vector_store.search(query, ollama, top_k=1)
+            except Exception:
+                runbooks = []
+
+        if not runbooks:
+            raw_runbooks = load_runbooks(RUNBOOKS_FILE)
+            err_code = event.get("error_code", "").upper()
+            msg_lower = event.get("message", "").lower()
+            for rb in raw_runbooks:
+                rb_code = rb.get("error_code", "").upper()
+                if rb_code and rb_code in err_code:
+                    runbooks = [{**rb, "score": 0.95}]
+                    break
+                keywords = [k for k in rb_code.lower().split("_") if len(k) > 2]
+                if any(kw in msg_lower for kw in keywords):
+                    runbooks = [{**rb, "score": 0.91}]
+                    break
 
     if not runbooks:
         runbooks = [{
@@ -146,13 +164,19 @@ def remediate_incident(payload: LogPayload):
             "text": "Inspect the service logs and check health status before changing settings.",
         }]
 
-    # Inference (Local Ollama or simulation fallback)
+    # Inference (Local Ollama, Groq cloud, or simulation fallback)
     rec = None
     if ollama.is_alive():
         try:
             rec = ollama.recommend(event, runbooks)
-        except Exception as err:
-            raise HTTPException(status_code=500, detail=f"LLM inference error: {err}")
+        except Exception:
+            rec = None
+
+    if not rec and groq.is_configured():
+        try:
+            rec = groq.recommend(event, runbooks)
+        except Exception:
+            rec = None
 
     if not rec:
         rec = {

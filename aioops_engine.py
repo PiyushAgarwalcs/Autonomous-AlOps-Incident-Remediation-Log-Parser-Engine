@@ -67,7 +67,7 @@ def process_event(
 
     try:
         recommendation = ollama.recommend(event, runbooks)
-    except ValueError as error:
+    except (ValueError, RuntimeError) as error:
         breaker.trip(str(error))
         return {"status": "dropped", "reason": str(error)}
 

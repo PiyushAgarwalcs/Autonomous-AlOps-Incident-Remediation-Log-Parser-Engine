@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/FastAPI-REST%20API-009688?style=flat&logo=fastapi"/>
   <img src="https://img.shields.io/badge/Streamlit-Dashboard-FF4B4B?style=flat&logo=streamlit"/>
   <img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Tests-15%20Passing-brightgreen?style=flat"/>
+  <img src="https://img.shields.io/badge/Tests-20%20Passing-brightgreen?style=flat"/>
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat"/>
 </p>
 
@@ -215,10 +215,12 @@ The image uses `python:3.10-slim`, includes a `HEALTHCHECK`, and exposes port `8
 python -m unittest discover -s tests -v
 ```
 
-**15 tests covering:**
+**20 tests covering:**
 - JSONL and raw syslog parsing
 - Circuit breaker: low confidence, NaN, `bash -c "rm -rf"` injection, shell chaining, reset lifecycle
 - `OllamaClient` localhost-only enforcement
+- `GroqClient` validation and markdown code fence stripping
+- FastAPI webhook endpoints (`/health`, `/ingest` validation)
 - ChromaDB cosine similarity and vector search
 - `follow_file` real-time tailing (`from_end=True` skip, existing-line reading)
 

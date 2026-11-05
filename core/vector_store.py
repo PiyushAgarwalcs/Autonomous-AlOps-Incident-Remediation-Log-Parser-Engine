@@ -124,9 +124,9 @@ class ChromaRunbooks:
                 include=["metadatas", "distances"],
             )
             matches = []
-            ids = results.get("ids", [[]])[0]
-            metadatas = results.get("metadatas", [[]])[0]
-            distances = results.get("distances", [[]])[0]
+            ids = (results.get("ids") or [[]])[0]
+            metadatas = (results.get("metadatas") or [[]])[0]
+            distances = (results.get("distances") or [[]])[0]
 
             for doc_id, meta, dist in zip(ids, metadatas, distances):
                 # Chroma cosine distance is 1 - similarity

@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from aioops_engine import CircuitBreaker, OllamaClient, parse_log_line
+from core.groq_client import GroqClient
 from core.parser import follow_file
 from core.vector_store import ChromaRunbooks, cosine_similarity
 from pathlib import Path
@@ -182,6 +183,70 @@ class FollowFileTests(unittest.TestCase):
                         "Should have read the newly appended line.")
         self.assertFalse(any("old error" in line for line in result_lines),
                          "Should have skipped the pre-existing line.")
+
+
+class GroqClientTests(unittest.TestCase):
+    def test_is_configured_validation(self):
+        client = GroqClient(api_key="gsk_123456789")
+        self.assertTrue(client.is_configured())
+        bad_client = GroqClient(api_key="not_a_groq_key")
+        self.assertFalse(bad_client.is_configured())
+        empty_client = GroqClient(api_key="")
+        self.assertFalse(empty_client.is_configured())
+
+    def test_strips_markdown_code_fences(self):
+        client = GroqClient(api_key="gsk_test")
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "choices": [{
+                "message": {
+                    "content": "```json\n{\"summary\": \"Test diag\", \"command\": \"systemctl status x\", \"confidence\": 0.9, \"confidence_flags\": {\"diagnosis\": true, \"runbook_support\": true, \"command_safety\": true}}\n```"
+                }
+            }]
+        }).encode("utf-8")
+
+        mock_enter = MagicMock(return_value=mock_resp)
+        mock_resp.__enter__ = mock_enter
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with unittest.mock.patch("urllib.request.urlopen", return_value=mock_resp):
+            rec = client.recommend({"service": "test", "message": "error"}, [])
+            self.assertEqual(rec["summary"], "Test diag")
+            self.assertEqual(rec["command"], "systemctl status x")
+
+
+class ApiEndpointTests(unittest.TestCase):
+    def test_health_check(self):
+        import api
+        with unittest.mock.patch.object(OllamaClient, "is_alive", return_value=False):
+            data = api.health_check()
+            self.assertEqual(data["status"], "healthy")
+            self.assertIn("circuit_breaker", data)
+            self.assertFalse(data["ollama_online"])
+
+    def test_ingest_structured_log_success(self):
+        import api
+        payload = api.LogPayload(
+            level="ERROR",
+            service="payments-api",
+            error_code="DB_POOL_EXHAUSTED",
+            message="Pool timed out",
+        )
+        res = api.ingest_log(payload)
+        self.assertEqual(res["status"], "accepted")
+        self.assertEqual(res["event"]["service"], "payments-api")
+
+    def test_ingest_rejects_info_level(self):
+        from fastapi import HTTPException
+        import api
+        payload = api.LogPayload(
+            level="INFO",
+            service="payments-api",
+            message="All systems operational",
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            api.ingest_log(payload)
+        self.assertEqual(ctx.exception.status_code, 400)
 
 
 if __name__ == "__main__":
