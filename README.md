@@ -1,74 +1,152 @@
-# AIOps Log Parser & Remediation Engine
+# 🛡️ Autonomous AIOps Incident Remediation & Log Parser Engine
 
-A lightweight Python CLI that follows a local JSON Lines or plain-text server log, retrieves matching SRE runbooks from Pinecone, and asks a text-only Ollama model for a structured remediation recommendation. It has no desktop control and never executes commands.
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![ChromaDB](https://img.shields.io/badge/Vector%20Store-ChromaDB-purple.svg)](https://www.trychroma.com/)
+[![Ollama](https://img.shields.io/badge/Local%20LLM-Ollama-black.svg)](https://ollama.com/)
+[![Streamlit](https://img.shields.io/badge/UI-Streamlit-red.svg)](https://streamlit.io/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-## Requirements
+An **air-gapped, human-in-the-loop AIOps engine** that streams server logs, retrieves relevant SRE runbooks using local **ChromaDB** vector search, and generates structured diagnostic recommendations using a local **Ollama** LLM. 
 
-- Python 3.10+
-- Ollama running on `localhost:11434`
-- `qwen2.5:7b` for text generation and `nomic-embed-text` for local embeddings
-- A Pinecone index configured for **768 dimensions** and cosine similarity
+Equipped with a deterministic **Fail-Closed Circuit Breaker** to guarantee that autonomous AI agents **never execute dangerous shell commands** on production infrastructure.
 
-Inference, embeddings, parsing, and command validation run locally. Pinecone remains a hosted dependency because this project retains Pinecone for vector retrieval; it must be replaced with a local vector store for a fully air-gapped deployment.
+---
 
-## Install and configure
+## 🎯 The Problem This Solves
 
+1. **High MTTR (Mean Time to Resolution):** On-call engineers waste 30–60 minutes searching for runbooks during late-night outages. This engine matches error logs to SRE playbooks in milliseconds.
+2. **The "Rogue Agent" Catastrophe:** Autonomous AI agents with terminal access can hallucinate destructive commands (`rm -rf`, modifying firewalls, restarting active databases). This engine enforces **Human-in-the-Loop** approval with hardcoded command safety blacklists.
+3. **Data Privacy & Compliance:** Cloud LLMs expose proprietary server logs and IPs. This system runs **100% on-premises / air-gapped** using Ollama and ChromaDB.
+
+---
+
+## 🏗️ System Architecture
+
+```mermaid
+flowchart TD
+    A["Log Source (JSONL / Raw Syslog)"] --> B["Streaming Parser (follow_file)"]
+    B --> C["Filter: ERROR / CRITICAL / FATAL"]
+    C --> D["Local Vector Search (ChromaDB)"]
+    D -->|Top-K SRE Runbooks| E["Local LLM Inference (Ollama: qwen2.5)"]
+    E -->|Structured JSON Output| F{"Circuit Breaker Guardrail"}
+    
+    F -->|Risky Command / Low Confidence| G["🛑 Trip Breaker -> Drop Task"]
+    F -->|Safe Diagnostic Command| H["🖥️ Streamlit Operator Dashboard"]
+    H --> I["👤 Human-in-the-Loop (Approve / Reject)"]
+```
+
+---
+
+## ✨ Key Features
+
+* **100% Local & Air-Gapped:** Zero external cloud dependencies. No Pinecone API keys required. Embeddings (`nomic-embed-text`) and inference (`qwen2.5:7b`) run on localhost.
+* **Deterministic Circuit Breaker Guardrail:**
+  * Blacklists high-risk commands (`rm`, `chmod`, `sudo`, `dd`, `kill`, `eval`, etc.).
+  * Disallows shell chaining and subshells (`;`, `&&`, `|`, `` ` ``, `$()`).
+  * Enforces minimum confidence thresholds and boolean validation flags (`diagnosis`, `runbook_support`, `command_safety`).
+  * Trips into an **Open (Safe)** state on violations until manually inspected and reset.
+* **Interactive Streamlit Dashboard:** Complete incident triage simulator with one-click scenarios, live confidence meters, runbook viewers, and an operator audit trail.
+* **Dual Ingestion Engine:** Supports real-time file following (`tail -f` style) and one-shot JSONL/Syslog parsing.
+
+---
+
+## 🚀 Quickstart
+
+### 1. Prerequisites
+* Python 3.10+
+* (Optional for live LLM inference) [Ollama](https://ollama.com/) running locally:
+  ```bash
+  ollama pull qwen2.5:7b
+  ollama pull nomic-embed-text
+  ```
+  *(Note: The Streamlit UI includes a built-in simulation fallback, so you can test all features even without Ollama running!)*
+
+### 2. Install Dependencies
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-ollama pull qwen2.5:7b
-ollama pull nomic-embed-text
-$env:PINECONE_API_KEY = "your-pinecone-api-key"
-$env:PINECONE_INDEX = "your-768-dimension-index"
 ```
 
-Start Ollama (for example, `ollama serve`) and make sure the Pinecone index already exists.
+### 3. Launch the Interactive Streamlit UI
+```powershell
+streamlit run app.py
+```
+Open your browser to `http://localhost:8501`.
 
-## Load runbooks and monitor logs
+### 4. (Optional) Run the FastAPI Ingestion Webhook
+Allow external microservices (Node.js, Python, Spring Boot) to push logs over HTTP:
+```powershell
+uvicorn api:app --reload --port 8000
+```
+View interactive Swagger docs at `http://localhost:8000/docs`.
 
-Runbook documents are JSONL records in `runbooks.jsonl`. Index them once:
+---
 
+## 💻 CLI Usage
+
+### Index SRE Runbooks into ChromaDB
 ```powershell
 python aioops_engine.py --sync-runbooks
 ```
 
-Process the included sample file once:
-
+### Process Sample Logs in One-Shot Mode
 ```powershell
 python aioops_engine.py --log-file samples/server.jsonl --once
 ```
 
-Follow a live log, processing new lines as they arrive:
-
+### Follow a Live Server Log
 ```powershell
-python aioops_engine.py --log-file C:\path\to\server.log
+python aioops_engine.py --log-file C:\path\to\server.log --from-end
 ```
 
-Add `--from-end` to ignore existing lines and wait only for new log entries. Plain-text lines are considered only when they contain `ERROR`, `CRITICAL`, or `FATAL`; JSON Lines records use a `level` field and an error `message`.
+---
 
-The engine emits JSON status records to stdout. A recommendation is displayed only when its confidence meets the configured threshold, all confidence flags are true, and the command passes the safety checks. Risky or low-confidence output opens the circuit breaker and drops the task; restart the process after investigating. The command is always a recommendation for human review and is never run by this program.
+## 🧪 Running Unit Tests
 
-## Input formats
-
-Structured JSON Lines (`samples/server.jsonl`):
-
-```json
-{"timestamp":"2026-11-03T08:30:00Z","level":"ERROR","service":"payments-api","error_code":"DB_POOL_EXHAUSTED","message":"Database connection pool exhausted after 30 seconds"}
-```
-
-Raw text is also accepted:
-
-```text
-2026-11-03 08:31:00 CRITICAL payments-api: database connection refused
-```
-
-Runbooks (`runbooks.jsonl`) use `id`, `error_code`, `title`, and `text` fields. Change models, Ollama URL, and confidence threshold with `--chat-model`, `--embedding-model`, `--ollama-url`, and `--min-confidence`.
-
-## Tests
+The test suite validates parser edge cases, circuit breaker tripping, high-risk command blocking, subshell injection prevention, and vector retrieval:
 
 ```powershell
 python -m unittest discover -s tests
 ```
 
-# Autonomous-AlOps-Incident-Remediation-Log-Parser-Engine
+---
+
+## 🐳 Docker Deployment
+
+To build and run the containerized Streamlit dashboard:
+
+```bash
+docker build -t aioops-engine .
+docker run -p 8501:8501 aioops-engine
+```
+
+---
+
+## 📂 Project Structure
+
+```text
+├── core/
+│   ├── parser.py          # Log stream follower & multi-format parser
+│   ├── guardrails.py      # Circuit Breaker & command blacklist engine
+│   ├── llm_client.py      # Local Ollama client with JSON Schema enforcement
+│   └── vector_store.py    # Local ChromaDB runbook vector store
+├── aioops_engine.py       # Core CLI orchestrator & event processor
+├── app.py                 # Streamlit SRE Operator Dashboard
+├── runbooks.jsonl         # SRE operational playbooks
+├── samples/
+│   └── server.jsonl       # Sample incident logs
+├── tests/
+│   └── test_aioops_engine.py  # Unit test suite
+├── Dockerfile             # Production container definition
+├── requirements.txt       # Project dependencies
+└── README.md              # Project documentation
+```
+
+---
+
+## 📜 Repository Guidelines
+
+- Inference is kept strictly local and text-only.
+- All AI recommendations require human operator review; commands are never executed autonomously.
+- Run `python -m unittest discover -s tests` after any engine modifications.

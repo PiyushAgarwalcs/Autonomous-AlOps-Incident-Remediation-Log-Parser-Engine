@@ -1,1 +1,5 @@
-pinecone>=5.0,<8.0
+chromadb>=0.4.0
+streamlit>=1.40.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.7.0

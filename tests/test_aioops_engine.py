@@ -1,6 +1,15 @@
+import json
+import os
+import tempfile
+import threading
+import time
 import unittest
+from unittest.mock import MagicMock
 
 from aioops_engine import CircuitBreaker, OllamaClient, parse_log_line
+from core.parser import follow_file
+from core.vector_store import ChromaRunbooks, cosine_similarity
+from pathlib import Path
 
 
 class ParseLogLineTests(unittest.TestCase):
@@ -63,11 +72,116 @@ class CircuitBreakerTests(unittest.TestCase):
         self.recommendation["command"] = "systemctl status x; systemctl restart x"
         self.assertIn("Shell operators", self.breaker.validate(self.recommendation))
 
+    def test_reset_circuit_breaker(self):
+        self.breaker.trip("Manual trip for testing")
+        self.assertTrue(self.breaker.is_open)
+        self.breaker.reset()
+        self.assertFalse(self.breaker.is_open)
+        self.assertEqual(self.breaker.reason, "")
+        self.assertIsNone(self.breaker.validate(self.recommendation))
+
 
 class OllamaLocalOnlyTests(unittest.TestCase):
     def test_rejects_remote_ollama_host(self):
         with self.assertRaises(ValueError):
             OllamaClient("https://example.com", "qwen2.5:7b", "nomic-embed-text")
+
+
+class VectorStoreTests(unittest.TestCase):
+    def test_cosine_similarity(self):
+        v1 = [1.0, 0.0, 0.0]
+        v2 = [1.0, 0.0, 0.0]
+        v3 = [0.0, 1.0, 0.0]
+        self.assertAlmostEqual(cosine_similarity(v1, v2), 1.0)
+        self.assertAlmostEqual(cosine_similarity(v1, v3), 0.0)
+
+    def test_chroma_runbooks_search_with_mock_ollama(self):
+        store = ChromaRunbooks(persist_dir="./test_chroma_db", collection_name="test_runbooks")
+        mock_ollama = MagicMock()
+        mock_ollama.embed.side_effect = lambda text: [1.0 if "pool" in text.lower() else 0.0, 0.5, 0.1]
+
+        runbooks = [
+            {
+                "id": "rb-1",
+                "error_code": "DB_POOL_EXHAUSTED",
+                "title": "Database connection pool exhausted",
+                "text": "Check payments-api database pool limits.",
+            }
+        ]
+        count = store.upsert(runbooks, mock_ollama)
+        self.assertEqual(count, 1)
+
+        results = store.search("DB connection pool is empty", mock_ollama, top_k=1)
+        self.assertGreaterEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], "rb-1")
+
+
+class FollowFileTests(unittest.TestCase):
+    def test_reads_existing_lines(self):
+        """follow_file should yield lines already in the file when from_end=False."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False, encoding="utf-8") as fh:
+            fh.write('{"level":"ERROR","message":"db down"}\n')
+            fh.write('{"level":"INFO","message":"ok"}\n')
+            path = Path(fh.name)
+
+        gen = follow_file(path, poll_interval=0.05, from_end=False)
+        collected = []
+        try:
+            # Read exactly 2 pre-existing lines then close the generator
+            collected.append(next(gen))
+            collected.append(next(gen))
+        finally:
+            gen.close()  # Triggers the finally block → closes the file handle
+            time.sleep(0.05)
+            try:
+                os.unlink(path)
+            except PermissionError:
+                pass
+
+        self.assertEqual(len(collected), 2)
+        self.assertIn("db down", collected[0])
+
+    def test_from_end_skips_existing_content(self):
+        """follow_file with from_end=True should not yield pre-existing lines."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False, encoding="utf-8") as fh:
+            fh.write('{"level":"ERROR","message":"old error"}\n')
+            path = Path(fh.name)
+
+        result_lines: list[str] = []
+        result_error: list[Exception] = []
+
+        def _tail():
+            gen = follow_file(path, poll_interval=0.05, from_end=True)
+            try:
+                # Block until one line is available (the appended line)
+                result_lines.append(next(gen))
+            except Exception as exc:
+                result_error.append(exc)
+            finally:
+                gen.close()
+
+        tail_thread = threading.Thread(target=_tail, daemon=True)
+        tail_thread.start()
+
+        # Wait briefly so the tailer positions at EOF, then append a new line
+        time.sleep(0.2)
+        with path.open("a", encoding="utf-8") as ap:
+            ap.write('{"level":"ERROR","message":"new error"}\n')
+
+        tail_thread.join(timeout=2.0)
+        time.sleep(0.05)
+        try:
+            os.unlink(path)
+        except PermissionError:
+            pass
+
+        if result_error:
+            self.fail(f"follow_file raised an unexpected error: {result_error[0]}")
+
+        self.assertTrue(any("new error" in line for line in result_lines),
+                        "Should have read the newly appended line.")
+        self.assertFalse(any("old error" in line for line in result_lines),
+                         "Should have skipped the pre-existing line.")
 
 
 if __name__ == "__main__":
