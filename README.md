@@ -1,7 +1,7 @@
 # 🛡️ Autonomous AIOps Incident Remediation & Log Parser Engine
 
 <p align="center">
-  <a href="https://autonomous-aioops.streamlit.app"><img src="https://img.shields.io/badge/🚀%20Live%20Demo-Streamlit%20Cloud-FF4B4B?style=for-the-badge" alt="Live Demo"/></a>
+  <a href="https://autonomous-aiops-incident-remediation-log-parser-engine.streamlit.app"><img src="https://img.shields.io/badge/🚀%20Live%20Demo-Streamlit%20Cloud-FF4B4B?style=for-the-badge" alt="Live Demo"/></a>
 </p>
 
 <p align="center">
@@ -21,6 +21,10 @@
 An **air-gapped, human-in-the-loop AIOps engine** that streams server logs, semantically retrieves relevant SRE runbooks via **ChromaDB** vector search, and generates structured diagnostic recommendations using a local **Ollama** LLM or **Groq Cloud** — with zero commands ever executed autonomously.
 
 A deterministic **Fail-Closed Circuit Breaker** guarantees that no AI-generated shell command ever touches production infrastructure without explicit human approval.
+
+<p align="center">
+  <img src="assets/dashboard_preview.jpg" alt="AIOps Remediation Dashboard" width="100%"/>
+</p>
 
 ---
 
