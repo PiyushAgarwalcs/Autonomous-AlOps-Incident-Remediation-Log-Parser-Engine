@@ -72,14 +72,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Initialize Session State
-if "breaker" not in st.session_state:
-    st.session_state.breaker = CircuitBreaker(minimum_confidence=0.75)
-
-if "audit_log" not in st.session_state:
-    # Restore from disk so the audit trail survives page refreshes
-    st.session_state.audit_log = _load_persisted_audit_log()
-
 RUNBOOKS_FILE = Path("runbooks.jsonl")
 INGESTED_LOGS_FILE = Path("ingested_logs.jsonl")
 AUDIT_LOG_FILE = Path("audit_log.jsonl")
@@ -106,6 +98,15 @@ def _append_audit_entry(entry: dict) -> None:
     """Persist a single audit log entry to disk."""
     with AUDIT_LOG_FILE.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+# Initialize Session State
+if "breaker" not in st.session_state:
+    st.session_state.breaker = CircuitBreaker(minimum_confidence=0.75)
+
+if "audit_log" not in st.session_state:
+    # Restore from disk so the audit trail survives page refreshes
+    st.session_state.audit_log = _load_persisted_audit_log()
 
 
 @st.cache_resource
