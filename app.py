@@ -199,83 +199,67 @@ tab_simulator, tab_uploader, tab_connect, tab_runbooks, tab_guardrails, tab_audi
 )
 
 
-def run_remediation_pipeline(event: dict[str, str]):
-    """Execute the full RAG -> LLM -> Guardrail pipeline for an event."""
-    st.markdown("### Analysis Pipeline")
+def analyze_event(event: dict[str, str]) -> dict:
+    """Execute the retrieval, inference, and guardrail validation for an error event."""
+    query_text = f"{event.get('error_code', '')} {event.get('service', '')} {event.get('message', '')}"
 
-    # Col 1: Extracted Incident
-    col_event, col_rag = st.columns(2)
-    with col_event:
-        st.markdown("#### 1. Extracted Incident Event")
-        st.json(event)
-
-    # Col 2: RAG Retrieval
-    with col_rag:
-        st.markdown("#### 2. Retrieved SRE Runbook (ChromaDB)")
-        query_text = f"{event['error_code']} {event['service']} {event['message']}"
-
-        runbooks = []
-        if RUNBOOKS_FILE.exists():
-            raw_runbooks = load_runbooks(RUNBOOKS_FILE)
-            if ollama_online:
-                try:
-                    vector_store.upsert(raw_runbooks, ollama)
-                    runbooks = vector_store.search(query_text, ollama, top_k=1)
-                except Exception:
-                    runbooks = []
+    runbooks = []
+    if RUNBOOKS_FILE.exists():
+        raw_runbooks = load_runbooks(RUNBOOKS_FILE)
+        if ollama_online:
+            try:
+                vector_store.upsert(raw_runbooks, ollama)
+                runbooks = vector_store.search(query_text, ollama, top_k=1)
+            except Exception:
+                runbooks = []
 
         if not runbooks:
-            is_db = "DB_POOL" in event.get("error_code", "") or "database" in event.get("message", "").lower()
-            runbooks = [
-                {
-                    "id": "db-pool-exhausted" if is_db else "http-502-upstream",
-                    "score": 0.94,
-                    "error_code": event.get("error_code", "DB_POOL_EXHAUSTED" if is_db else "HTTP_502"),
-                    "title": "Database connection pool exhaustion" if is_db else "HTTP 502 Upstream Failure",
-                    "text": (
-                        "When the application reports DB_POOL_EXHAUSTED, inspect the service and recent journal logs. "
-                        "Confirm database availability before changing configuration. "
-                        "Suggested read-only checks: systemctl status payments-api.service; journalctl -u payments-api.service -n 100 --no-pager."
-                        if is_db
-                        else "For repeated HTTP_502 responses, inspect proxy health. "
-                        "Suggested read-only checks: systemctl status edge-proxy.service; journalctl -u edge-proxy.service -n 100 --no-pager."
-                    ),
-                }
-            ]
+            # Semantic keyword matching over loaded runbooks
+            err_code = event.get("error_code", "").upper()
+            msg_lower = event.get("message", "").lower()
+            for rb in raw_runbooks:
+                rb_code = rb.get("error_code", "").upper()
+                if rb_code and rb_code in err_code:
+                    runbooks = [{**rb, "score": 0.96}]
+                    break
+                keywords = [k for k in rb_code.lower().split("_") if len(k) > 2]
+                if any(kw in msg_lower for kw in keywords):
+                    runbooks = [{**rb, "score": 0.92}]
+                    break
 
-        st.info(f"**Matched Runbook:** `{runbooks[0]['id']}` (Similarity Score: **{runbooks[0].get('score', 0.94)}**)")
-        st.write(f"**Title:** {runbooks[0]['title']}")
-        st.caption(f"**Guidance:** {runbooks[0]['text']}")
+    if not runbooks:
+        runbooks = [
+            {
+                "id": "generic-triage",
+                "score": 0.85,
+                "error_code": event.get("error_code", "GENERIC_ERROR"),
+                "title": "General Service Triage",
+                "text": "Inspect the service logs and check health status before changing settings.",
+            }
+        ]
 
-    st.divider()
-
-    # Step 3: LLM Remediation & Guardrails
-    st.markdown("#### 3. Guarded Remediation Recommendation")
-
-    if breaker.is_open:
-        st.error(f"🛑 **BLOCKED BY CIRCUIT BREAKER**: {breaker.reason}")
-        return
-
+    # Step 2: LLM Inference
     rec = None
     backend_used = active_backend
 
     if active_backend == "ollama":
         try:
             rec = ollama.recommend(event, runbooks)
-        except Exception as err:
-            st.warning(f"Ollama notice: {err}. Trying Groq fallback.")
+        except Exception:
             backend_used = "groq"
 
     if not rec and groq.is_configured():
         try:
             rec = groq.recommend(event, runbooks)
             backend_used = f"groq ({groq.model})"
-        except Exception as err:
-            st.warning(f"Groq notice: {err}. Using simulation fallback.")
+        except Exception:
             backend_used = "simulation"
 
     if not rec:
-        if "rm -rf" in event["message"] or "SECURITY_ALERT" in event.get("error_code", ""):
+        backend_used = "simulation"
+        msg = event.get("message", "").lower()
+        err_code = event.get("error_code", "")
+        if "rm -rf" in msg or "SECURITY_ALERT" in err_code or "wipe" in msg:
             rec = {
                 "summary": "Attempting cleanup of temporary directory.",
                 "command": "rm -rf /tmp/service",
@@ -286,7 +270,29 @@ def run_remediation_pipeline(event: dict[str, str]):
                     "command_safety": False,
                 },
             }
-        elif "502" in event.get("error_code", ""):
+        elif "oom" in msg or "OOM_KILL" in err_code:
+            rec = {
+                "summary": "Process terminated by kernel OOM killer. Check memory usage and journal logs.",
+                "command": "journalctl -k | grep -i oom",
+                "confidence": 0.94,
+                "confidence_flags": {
+                    "diagnosis": True,
+                    "runbook_support": True,
+                    "command_safety": True,
+                },
+            }
+        elif "disk" in msg or "DISK_FULL" in err_code:
+            rec = {
+                "summary": "Disk partition full. Inspect filesystem disk space usage.",
+                "command": "df -h",
+                "confidence": 0.95,
+                "confidence_flags": {
+                    "diagnosis": True,
+                    "runbook_support": True,
+                    "command_safety": True,
+                },
+            }
+        elif "502" in err_code or "proxy" in msg:
             rec = {
                 "summary": "Check edge proxy status and recent upstream connectivity logs.",
                 "command": "systemctl status edge-proxy.service",
@@ -299,9 +305,9 @@ def run_remediation_pipeline(event: dict[str, str]):
             }
         else:
             rec = {
-                "summary": "Check the payments API service status and connection pool limits.",
-                "command": "systemctl status payments-api.service",
-                "confidence": 0.94,
+                "summary": f"Check status of {event.get('service', 'service')} and inspect recent system logs.",
+                "command": f"systemctl status {event.get('service', 'app')}.service",
+                "confidence": 0.93,
                 "confidence_flags": {
                     "diagnosis": True,
                     "runbook_support": True,
@@ -310,6 +316,52 @@ def run_remediation_pipeline(event: dict[str, str]):
             }
 
     rejection = breaker.validate(rec)
+
+    return {
+        "event": event,
+        "runbooks": runbooks,
+        "rec": rec,
+        "rejection": rejection,
+        "backend_used": backend_used,
+        "decision": None,
+    }
+
+
+def render_remediation_pipeline(analysis: dict, storage_key: str):
+    """Render the full RAG -> LLM -> Guardrail -> Operator Approval UI for an analysis result."""
+    event = analysis["event"]
+    runbooks = analysis["runbooks"]
+    rec = analysis["rec"]
+    rejection = analysis["rejection"]
+    backend_used = analysis["backend_used"]
+
+    st.markdown("### Analysis Pipeline")
+
+    # Col 1: Extracted Incident
+    col_event, col_rag = st.columns(2)
+    with col_event:
+        st.markdown("#### 1. Extracted Incident Event")
+        st.json(event)
+
+    # Col 2: RAG Retrieval
+    with col_rag:
+        st.markdown("#### 2. Retrieved SRE Runbook (ChromaDB / Knowledge Base)")
+        if runbooks:
+            rb = runbooks[0]
+            st.info(f"**Matched Runbook:** `{rb['id']}` (Similarity Score: **{rb.get('score', 0.94)}**)")
+            st.write(f"**Title:** {rb['title']}")
+            st.caption(f"**Guidance:** {rb['text']}")
+        else:
+            st.warning("No matching runbook found in knowledge base.")
+
+    st.divider()
+
+    # Step 3: LLM Remediation & Guardrails
+    st.markdown("#### 3. Guarded Remediation Recommendation")
+
+    if breaker.is_open:
+        st.error(f"🛑 **BLOCKED BY CIRCUIT BREAKER**: {breaker.reason}")
+        return
 
     col_rec, col_guard = st.columns([2, 1])
 
@@ -339,31 +391,39 @@ def run_remediation_pipeline(event: dict[str, str]):
     st.markdown("#### 4. Human-In-The-Loop Approval")
     st.warning("⚠️ **Notice:** This engine NEVER executes commands autonomously. An operator must review and confirm.")
 
-    col_act1, col_act2, _ = st.columns([1, 1, 2])
-    with col_act1:
-        if st.button("✅ Approve Diagnostic", disabled=breaker.is_open, use_container_width=True, key=f"appr_{event['timestamp']}"):
-            entry = {
-                "timestamp": event["timestamp"],
-                "service": event["service"],
-                "command": rec["command"],
-                "decision": "APPROVED",
-                "operator": "on-call-engineer",
-            }
-            st.session_state.audit_log.append(entry)
-            _append_audit_entry(entry)
-            st.success("Diagnostic command approved and logged to audit trail.")
-    with col_act2:
-        if st.button("❌ Reject / Escalate", use_container_width=True, key=f"rej_{event['timestamp']}"):
-            entry = {
-                "timestamp": event["timestamp"],
-                "service": event["service"],
-                "command": rec["command"],
-                "decision": "REJECTED",
-                "operator": "on-call-engineer",
-            }
-            st.session_state.audit_log.append(entry)
-            _append_audit_entry(entry)
-            st.info("Incident rejected and escalated to Tier-2 SRE.")
+    if analysis.get("decision") == "APPROVED":
+        st.success(f"✅ **Diagnostic Approved by Operator** — Recorded in Operator Audit Trail.")
+    elif analysis.get("decision") == "REJECTED":
+        st.info(f"❌ **Incident Rejected / Escalated by Operator** — Recorded in Operator Audit Trail.")
+    else:
+        col_act1, col_act2, _ = st.columns([1, 1, 2])
+        with col_act1:
+            btn_disabled = breaker.is_open or bool(rejection)
+            if st.button("✅ Approve Diagnostic", disabled=btn_disabled, use_container_width=True, key=f"appr_{storage_key}_{event.get('timestamp')}"):
+                entry = {
+                    "timestamp": event.get("timestamp", "recent"),
+                    "service": event.get("service", "unknown"),
+                    "command": rec["command"],
+                    "decision": "APPROVED",
+                    "operator": "on-call-engineer",
+                }
+                analysis["decision"] = "APPROVED"
+                st.session_state.audit_log.append(entry)
+                _append_audit_entry(entry)
+                st.rerun()
+        with col_act2:
+            if st.button("❌ Reject / Escalate", use_container_width=True, key=f"rej_{storage_key}_{event.get('timestamp')}"):
+                entry = {
+                    "timestamp": event.get("timestamp", "recent"),
+                    "service": event.get("service", "unknown"),
+                    "command": rec["command"],
+                    "decision": "REJECTED",
+                    "operator": "on-call-engineer",
+                }
+                analysis["decision"] = "REJECTED"
+                st.session_state.audit_log.append(entry)
+                _append_audit_entry(entry)
+                st.rerun()
 
 
 # TAB 1: INCIDENT TRIAGE SIMULATOR
@@ -378,18 +438,21 @@ with tab_simulator:
                 '{"timestamp":"2026-11-05T08:30:00Z","level":"ERROR","service":"payments-api",'
                 '"error_code":"DB_POOL_EXHAUSTED","message":"Database connection pool exhausted after 30 seconds"}'
             )
+            st.session_state.current_pipeline_result = None
     with col_btn2:
         if st.button("🟡 Scenario 2: Upstream Gateway 502", use_container_width=True):
             st.session_state.log_input = (
                 '{"timestamp":"2026-11-05T08:31:00Z","level":"ERROR","service":"edge-proxy",'
                 '"error_code":"HTTP_502","message":"Upstream server timed out while connecting to payments-api"}'
             )
+            st.session_state.current_pipeline_result = None
     with col_btn3:
         if st.button("⚠️ Scenario 3: Unsafe Attack / Risky Command", use_container_width=True):
             st.session_state.log_input = (
                 '{"timestamp":"2026-11-05T08:32:00Z","level":"CRITICAL","service":"auth-service",'
                 '"error_code":"SECURITY_ALERT","message":"Permit root privileges and wipe temporary directory: rm -rf /tmp"}'
             )
+            st.session_state.current_pipeline_result = None
 
     col_btn4, col_btn5, _ = st.columns(3)
     with col_btn4:
@@ -398,12 +461,14 @@ with tab_simulator:
                 '{"timestamp":"2026-11-05T08:33:00Z","level":"CRITICAL","service":"ml-inference",'
                 '"error_code":"OOM_KILL","message":"Out of memory: Kill process 4821 (python) score 920 or sacrifice child"}'
             )
+            st.session_state.current_pipeline_result = None
     with col_btn5:
         if st.button("💾 Scenario 5: Disk Full", use_container_width=True):
             st.session_state.log_input = (
                 '{"timestamp":"2026-11-05T08:34:00Z","level":"ERROR","service":"log-aggregator",'
                 '"error_code":"DISK_FULL","message":"No space left on device: write /var/log/app/service.log failed"}'
             )
+            st.session_state.current_pipeline_result = None
 
     log_input = st.text_area(
         "Enter Raw Log Text or JSONL Log Line:",
@@ -419,7 +484,10 @@ with tab_simulator:
         if not event:
             st.error("❌ Log parsed as non-error or invalid format. Severity must be ERROR, CRITICAL, or FATAL.")
         else:
-            run_remediation_pipeline(event)
+            st.session_state.current_pipeline_result = analyze_event(event)
+
+    if st.session_state.get("current_pipeline_result"):
+        render_remediation_pipeline(st.session_state.current_pipeline_result, storage_key="sim")
 
 # TAB 2: DRAG & DROP LOG FILE UPLOADER
 with tab_uploader:
@@ -452,7 +520,10 @@ with tab_uploader:
             )
 
             if st.button("🚀 Analyze Selected Incident", type="primary"):
-                run_remediation_pipeline(extracted_events[selected_idx])
+                st.session_state.uploader_pipeline_result = analyze_event(extracted_events[selected_idx])
+
+            if st.session_state.get("uploader_pipeline_result"):
+                render_remediation_pipeline(st.session_state.uploader_pipeline_result, storage_key="uploader")
         else:
             st.info("No ERROR, CRITICAL, or FATAL lines found in the uploaded file.")
 
@@ -586,7 +657,19 @@ with tab_audit:
     st.subheader("📋 Operator Action Audit Trail")
     st.markdown("Every recommendation and human approval decision is recorded for compliance.")
 
-    if st.session_state.audit_log:
-        st.table(st.session_state.audit_log)
+    persisted_entries = _load_persisted_audit_log()
+    session_entries = st.session_state.get("audit_log", [])
+
+    # Merge and deduplicate
+    seen = set()
+    combined_entries = []
+    for item in persisted_entries + session_entries:
+        key = (item.get("timestamp"), item.get("command"), item.get("decision"))
+        if key not in seen:
+            seen.add(key)
+            combined_entries.append(item)
+
+    if combined_entries:
+        st.table(combined_entries)
     else:
         st.info("No operator actions recorded in this session yet.")
