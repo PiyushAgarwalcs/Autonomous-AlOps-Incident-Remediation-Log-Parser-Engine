@@ -36,6 +36,7 @@ from core.vector_store import (
     ChromaRunbooks,
     load_runbooks,
 )
+from core.metrics import PipelineMetrics, timed_stage
 
 
 def emit(record: dict[str, Any]) -> None:
@@ -52,30 +53,55 @@ def process_event(
     ollama: OllamaClient,
     breaker: CircuitBreaker,
     top_k: int = 3,
+    metrics: PipelineMetrics | None = None,
 ) -> dict[str, Any]:
     """Process a single parsed error event through retrieval, inference, and guardrails."""
-    if breaker.is_open:
-        return {"status": "dropped", "reason": f"Circuit breaker is open: {breaker.reason}"}
+    with timed_stage("end_to_end") as e2e:
+        if breaker.is_open:
+            result = {"status": "dropped", "reason": f"Circuit breaker is open: {breaker.reason}"}
+            if metrics:
+                metrics.record_event("dropped", e2e_ms=e2e.duration_ms)
+            return result
 
-    runbooks = store.search(
-        f"{event['error_code']} {event['service']} {event['message']}",
-        ollama,
-        top_k,
-    )
-    if not runbooks:
-        return {"status": "skipped", "reason": "No matching runbook found."}
+        with timed_stage("retrieval") as t_ret:
+            runbooks = store.search(
+                f"{event['error_code']} {event['service']} {event['message']}",
+                ollama,
+                top_k,
+            )
+        if not runbooks:
+            result = {"status": "skipped", "reason": "No matching runbook found."}
+            if metrics:
+                metrics.record_event("skipped", retrieval_ms=t_ret.duration_ms, e2e_ms=e2e.duration_ms)
+            return result
 
-    try:
-        recommendation = ollama.recommend(event, runbooks)
-    except (ValueError, RuntimeError) as error:
-        breaker.trip(str(error))
-        return {"status": "dropped", "reason": str(error)}
+        with timed_stage("inference") as t_inf:
+            try:
+                recommendation = ollama.recommend(event, runbooks)
+            except (ValueError, RuntimeError) as error:
+                breaker.trip(str(error))
+                result = {"status": "dropped", "reason": str(error)}
+                if metrics:
+                    metrics.record_event(
+                        "dropped", backend="ollama",
+                        retrieval_ms=t_ret.duration_ms, inference_ms=t_inf.duration_ms,
+                    )
+                return result
 
-    rejection = breaker.validate(recommendation)
-    if rejection:
-        return {"status": "dropped", "reason": rejection}
+        with timed_stage("guardrail") as t_guard:
+            rejection = breaker.validate(recommendation)
 
-    return {
+        if rejection:
+            result = {"status": "dropped", "reason": rejection}
+            if metrics:
+                metrics.record_event(
+                    "dropped", backend="ollama",
+                    retrieval_ms=t_ret.duration_ms, inference_ms=t_inf.duration_ms,
+                    guardrail_ms=t_guard.duration_ms,
+                )
+            return result
+
+    result = {
         "status": "recommendation",
         "event": event,
         "runbook": runbooks[0].get("id", ""),
@@ -84,7 +110,20 @@ def process_event(
         "confidence": recommendation["confidence"],
         "human_approval_required": True,
         "executed": False,
+        "latency_ms": {
+            "retrieval": round(t_ret.duration_ms, 2),
+            "inference": round(t_inf.duration_ms, 2),
+            "guardrail": round(t_guard.duration_ms, 2),
+            "end_to_end": round(e2e.duration_ms, 2),
+        },
     }
+    if metrics:
+        metrics.record_event(
+            "recommendation", backend="ollama",
+            retrieval_ms=t_ret.duration_ms, inference_ms=t_inf.duration_ms,
+            guardrail_ms=t_guard.duration_ms, e2e_ms=e2e.duration_ms,
+        )
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -138,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     breaker = CircuitBreaker(minimum_confidence=args.min_confidence)
+    metrics = PipelineMetrics()
     lines: Iterator[str]
     if args.once:
         with args.log_file.open("r", encoding="utf-8", errors="replace") as source:
@@ -148,14 +188,23 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         for line in lines:
-            event = parse_log_line(line)
+            with timed_stage("parsing") as t_parse:
+                event = parse_log_line(line)
             if event:
-                result = process_event(event, store, ollama, breaker, args.top_k)
+                result = process_event(event, store, ollama, breaker, args.top_k, metrics)
+                if t_parse.duration_ms > 0:
+                    metrics._parse_latencies.append(t_parse.duration_ms)
                 emit(result)
                 logger.info("Processed event [%s/%s] → status=%s", event["service"], event["level"], result["status"])
     except KeyboardInterrupt:
         logger.info("Interrupted by operator — shutting down cleanly.")
+        summary = metrics.snapshot()
+        emit({"status": "metrics_summary", "metrics": summary})
+        logger.info("Pipeline metrics: %s", json.dumps(summary, indent=2))
         return 0
+
+    summary = metrics.snapshot()
+    emit({"status": "metrics_summary", "metrics": summary})
     return 0
 
 

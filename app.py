@@ -23,6 +23,7 @@ from core.groq_client import (
 )
 from core.parser import parse_log_line
 from core.vector_store import ChromaRunbooks, load_runbooks
+from core.metrics import PipelineMetrics, timed_stage
 
 # Set page configuration
 st.set_page_config(
@@ -108,6 +109,9 @@ if "audit_log" not in st.session_state:
     # Restore from disk so the audit trail survives page refreshes
     st.session_state.audit_log = _load_persisted_audit_log()
 
+if "metrics" not in st.session_state:
+    st.session_state.metrics = PipelineMetrics()
+
 
 @st.cache_resource
 def get_vector_store():
@@ -187,7 +191,7 @@ st.markdown(
     "Features a deterministic **Circuit Breaker** to prevent unauthorized or dangerous shell commands."
 )
 
-tab_simulator, tab_uploader, tab_connect, tab_runbooks, tab_guardrails, tab_audit = st.tabs(
+tab_simulator, tab_uploader, tab_connect, tab_runbooks, tab_guardrails, tab_audit, tab_metrics = st.tabs(
     [
         "🎮 Incident Simulator",
         "📂 Upload Log File",
@@ -195,127 +199,148 @@ tab_simulator, tab_uploader, tab_connect, tab_runbooks, tab_guardrails, tab_audi
         "📚 SRE Runbooks",
         "🛡️ Guardrail Architecture",
         "📋 Operator Audit Log",
+        "⚡ Performance Metrics",
     ]
 )
 
 
 def analyze_event(event: dict[str, str]) -> dict:
     """Execute the retrieval, inference, and guardrail validation for an error event."""
-    query_text = f"{event.get('error_code', '')} {event.get('service', '')} {event.get('message', '')}"
+    pm: PipelineMetrics = st.session_state.metrics
 
-    runbooks = []
-    if RUNBOOKS_FILE.exists():
-        raw_runbooks = load_runbooks(RUNBOOKS_FILE)
-        if ollama_online:
-            try:
-                vector_store.upsert(raw_runbooks, ollama)
-                runbooks = vector_store.search(query_text, ollama, top_k=1)
-            except Exception:
-                runbooks = []
+    with timed_stage("end_to_end") as e2e:
+        query_text = f"{event.get('error_code', '')} {event.get('service', '')} {event.get('message', '')}"
 
-        if not runbooks:
-            # Semantic keyword matching over loaded runbooks
-            err_code = event.get("error_code", "").upper()
-            msg_lower = event.get("message", "").lower()
-            for rb in raw_runbooks:
-                rb_code = rb.get("error_code", "").upper()
-                if rb_code and rb_code in err_code:
-                    runbooks = [{**rb, "score": 0.96}]
-                    break
-                keywords = [k for k in rb_code.lower().split("_") if len(k) > 2]
-                if any(kw in msg_lower for kw in keywords):
-                    runbooks = [{**rb, "score": 0.92}]
-                    break
+        runbooks = []
+        with timed_stage("retrieval") as t_ret:
+            if RUNBOOKS_FILE.exists():
+                raw_runbooks = load_runbooks(RUNBOOKS_FILE)
+                if ollama_online:
+                    try:
+                        vector_store.upsert(raw_runbooks, ollama)
+                        runbooks = vector_store.search(query_text, ollama, top_k=1)
+                    except Exception:
+                        runbooks = []
 
-    if not runbooks:
-        runbooks = [
-            {
-                "id": "generic-triage",
-                "score": 0.85,
-                "error_code": event.get("error_code", "GENERIC_ERROR"),
-                "title": "General Service Triage",
-                "text": "Inspect the service logs and check health status before changing settings.",
-            }
-        ]
+                if not runbooks:
+                    # Semantic keyword matching over loaded runbooks
+                    err_code = event.get("error_code", "").upper()
+                    msg_lower = event.get("message", "").lower()
+                    for rb in raw_runbooks:
+                        rb_code = rb.get("error_code", "").upper()
+                        if rb_code and rb_code in err_code:
+                            runbooks = [{**rb, "score": 0.96}]
+                            break
+                        keywords = [k for k in rb_code.lower().split("_") if len(k) > 2]
+                        if any(kw in msg_lower for kw in keywords):
+                            runbooks = [{**rb, "score": 0.92}]
+                            break
 
-    # Step 2: LLM Inference
-    rec = None
-    backend_used = active_backend
+            if not runbooks:
+                runbooks = [
+                    {
+                        "id": "generic-triage",
+                        "score": 0.85,
+                        "error_code": event.get("error_code", "GENERIC_ERROR"),
+                        "title": "General Service Triage",
+                        "text": "Inspect the service logs and check health status before changing settings.",
+                    }
+                ]
 
-    if active_backend == "ollama":
-        try:
-            rec = ollama.recommend(event, runbooks)
-        except Exception:
-            backend_used = "groq"
+        # Step 2: LLM Inference
+        rec = None
+        backend_used = active_backend
 
-    if not rec and groq.is_configured():
-        try:
-            rec = groq.recommend(event, runbooks)
-            backend_used = f"groq ({groq.model})"
-        except Exception:
-            backend_used = "simulation"
+        with timed_stage("inference") as t_inf:
+            if active_backend == "ollama":
+                try:
+                    rec = ollama.recommend(event, runbooks)
+                except Exception:
+                    backend_used = "groq"
 
-    if not rec:
-        backend_used = "simulation"
-        msg = event.get("message", "").lower()
-        err_code = event.get("error_code", "")
-        if "rm -rf" in msg or "SECURITY_ALERT" in err_code or "wipe" in msg:
-            rec = {
-                "summary": "Attempting cleanup of temporary directory.",
-                "command": "rm -rf /tmp/service",
-                "confidence": 0.95,
-                "confidence_flags": {
-                    "diagnosis": True,
-                    "runbook_support": False,
-                    "command_safety": False,
-                },
-            }
-        elif "oom" in msg or "OOM_KILL" in err_code:
-            rec = {
-                "summary": "Process terminated by kernel OOM killer. Check memory usage and journal logs.",
-                "command": "journalctl -k | grep -i oom",
-                "confidence": 0.94,
-                "confidence_flags": {
-                    "diagnosis": True,
-                    "runbook_support": True,
-                    "command_safety": True,
-                },
-            }
-        elif "disk" in msg or "DISK_FULL" in err_code:
-            rec = {
-                "summary": "Disk partition full. Inspect filesystem disk space usage.",
-                "command": "df -h",
-                "confidence": 0.95,
-                "confidence_flags": {
-                    "diagnosis": True,
-                    "runbook_support": True,
-                    "command_safety": True,
-                },
-            }
-        elif "502" in err_code or "proxy" in msg:
-            rec = {
-                "summary": "Check edge proxy status and recent upstream connectivity logs.",
-                "command": "systemctl status edge-proxy.service",
-                "confidence": 0.92,
-                "confidence_flags": {
-                    "diagnosis": True,
-                    "runbook_support": True,
-                    "command_safety": True,
-                },
-            }
-        else:
-            rec = {
-                "summary": f"Check status of {event.get('service', 'service')} and inspect recent system logs.",
-                "command": f"systemctl status {event.get('service', 'app')}.service",
-                "confidence": 0.93,
-                "confidence_flags": {
-                    "diagnosis": True,
-                    "runbook_support": True,
-                    "command_safety": True,
-                },
-            }
+            if not rec and groq.is_configured():
+                try:
+                    rec = groq.recommend(event, runbooks)
+                    backend_used = f"groq ({groq.model})"
+                except Exception:
+                    backend_used = "simulation"
 
-    rejection = breaker.validate(rec)
+            if not rec:
+                backend_used = "simulation"
+                msg = event.get("message", "").lower()
+                err_code = event.get("error_code", "")
+                if "rm -rf" in msg or "SECURITY_ALERT" in err_code or "wipe" in msg:
+                    rec = {
+                        "summary": "Attempting cleanup of temporary directory.",
+                        "command": "rm -rf /tmp/service",
+                        "confidence": 0.95,
+                        "confidence_flags": {
+                            "diagnosis": True,
+                            "runbook_support": False,
+                            "command_safety": False,
+                        },
+                    }
+                elif "oom" in msg or "OOM_KILL" in err_code:
+                    rec = {
+                        "summary": "Process terminated by kernel OOM killer. Check memory usage and journal logs.",
+                        "command": "journalctl -k | grep -i oom",
+                        "confidence": 0.94,
+                        "confidence_flags": {
+                            "diagnosis": True,
+                            "runbook_support": True,
+                            "command_safety": True,
+                        },
+                    }
+                elif "disk" in msg or "DISK_FULL" in err_code:
+                    rec = {
+                        "summary": "Disk partition full. Inspect filesystem disk space usage.",
+                        "command": "df -h",
+                        "confidence": 0.95,
+                        "confidence_flags": {
+                            "diagnosis": True,
+                            "runbook_support": True,
+                            "command_safety": True,
+                        },
+                    }
+                elif "502" in err_code or "proxy" in msg:
+                    rec = {
+                        "summary": "Check edge proxy status and recent upstream connectivity logs.",
+                        "command": "systemctl status edge-proxy.service",
+                        "confidence": 0.92,
+                        "confidence_flags": {
+                            "diagnosis": True,
+                            "runbook_support": True,
+                            "command_safety": True,
+                        },
+                    }
+                else:
+                    rec = {
+                        "summary": f"Check status of {event.get('service', 'service')} and inspect recent system logs.",
+                        "command": f"systemctl status {event.get('service', 'app')}.service",
+                        "confidence": 0.93,
+                        "confidence_flags": {
+                            "diagnosis": True,
+                            "runbook_support": True,
+                            "command_safety": True,
+                        },
+                    }
+
+        with timed_stage("guardrail") as t_guard:
+            rejection = breaker.validate(rec)
+
+    latency = {
+        "retrieval_ms": round(t_ret.duration_ms, 2),
+        "inference_ms": round(t_inf.duration_ms, 2),
+        "guardrail_ms": round(t_guard.duration_ms, 2),
+        "end_to_end_ms": round(e2e.duration_ms, 2),
+    }
+
+    status = "recommendation" if not rejection else "dropped"
+    pm.record_event(
+        status, backend=backend_used,
+        retrieval_ms=t_ret.duration_ms, inference_ms=t_inf.duration_ms,
+        guardrail_ms=t_guard.duration_ms, e2e_ms=e2e.duration_ms,
+    )
 
     return {
         "event": event,
@@ -324,6 +349,7 @@ def analyze_event(event: dict[str, str]) -> dict:
         "rejection": rejection,
         "backend_used": backend_used,
         "decision": None,
+        "latency": latency,
     }
 
 
@@ -385,6 +411,16 @@ def render_remediation_pipeline(analysis: dict, storage_key: str):
             st.markdown("<span class='badge-safe'>SAFE FOR HUMAN REVIEW</span>", unsafe_allow_html=True)
 
         st.caption("Checked: Read-Only, No Shell Chaining, Whitelisted Syntax, High Confidence.")
+
+    # Latency & Performance Breakdown
+    latency = analysis.get("latency", {})
+    if latency:
+        st.markdown("##### ⏱️ Pipeline Latency Telemetry")
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        m_col1.metric("Runbook Retrieval", f"{latency.get('retrieval_ms', 0):.1f} ms")
+        m_col2.metric("LLM Inference", f"{latency.get('inference_ms', 0):.1f} ms")
+        m_col3.metric("Guardrail Validation", f"{latency.get('guardrail_ms', 0):.1f} ms")
+        m_col4.metric("Total End-to-End", f"{latency.get('end_to_end_ms', 0):.1f} ms")
 
     # Step 4: Human in the loop decision
     st.divider()
@@ -673,3 +709,53 @@ with tab_audit:
         st.table(combined_entries)
     else:
         st.info("No operator actions recorded in this session yet.")
+
+# TAB 7: PERFORMANCE & SLA METRICS
+with tab_metrics:
+    st.subheader("⚡ Operational Latency & SLA Performance Metrics")
+    st.markdown("Real-time telemetry measuring pipeline latency across ingestion, retrieval, LLM inference, and guardrail validation.")
+
+    pm: PipelineMetrics = st.session_state.metrics
+    snap = pm.snapshot()
+    counters = snap["counters"]
+    lat = snap["latency"]
+    backends = snap["backend_usage"]
+
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    with col_m1:
+        st.metric("Total Events Processed", counters["total_events"])
+    with col_m2:
+        st.metric("Success Rate", f"{counters['success_rate']}%")
+    with col_m3:
+        st.metric("Avg E2E Latency", f"{lat['end_to_end']['avg_ms']} ms")
+    with col_m4:
+        st.metric("P95 E2E Latency", f"{lat['end_to_end']['p95_ms']} ms")
+
+    st.divider()
+    st.markdown("#### ⏱️ Stage-by-Stage Latency Distribution (ms)")
+
+    stage_data = [
+        {"Stage": "Log Parsing", "Min (ms)": lat["parsing"]["min_ms"], "Avg (ms)": lat["parsing"]["avg_ms"], "P95 (ms)": lat["parsing"]["p95_ms"], "Max (ms)": lat["parsing"]["max_ms"], "Samples": lat["parsing"]["count"]},
+        {"Stage": "Runbook Retrieval (ChromaDB)", "Min (ms)": lat["retrieval"]["min_ms"], "Avg (ms)": lat["retrieval"]["avg_ms"], "P95 (ms)": lat["retrieval"]["p95_ms"], "Max (ms)": lat["retrieval"]["max_ms"], "Samples": lat["retrieval"]["count"]},
+        {"Stage": "LLM Inference", "Min (ms)": lat["inference"]["min_ms"], "Avg (ms)": lat["inference"]["avg_ms"], "P95 (ms)": lat["inference"]["p95_ms"], "Max (ms)": lat["inference"]["max_ms"], "Samples": lat["inference"]["count"]},
+        {"Stage": "Guardrail Circuit Breaker", "Min (ms)": lat["guardrail"]["min_ms"], "Avg (ms)": lat["guardrail"]["avg_ms"], "P95 (ms)": lat["guardrail"]["p95_ms"], "Max (ms)": lat["guardrail"]["max_ms"], "Samples": lat["guardrail"]["count"]},
+        {"Stage": "Total End-to-End Pipeline", "Min (ms)": lat["end_to_end"]["min_ms"], "Avg (ms)": lat["end_to_end"]["avg_ms"], "P95 (ms)": lat["end_to_end"]["p95_ms"], "Max (ms)": lat["end_to_end"]["max_ms"], "Samples": lat["end_to_end"]["count"]},
+    ]
+    st.table(stage_data)
+
+    st.divider()
+    col_b1, col_b2 = st.columns(2)
+    with col_b1:
+        st.markdown("#### 🤖 LLM Backend Invocations")
+        st.write(f"- **Local Ollama:** {backends['ollama']}")
+        st.write(f"- **Groq Cloud:** {backends['groq']}")
+        st.write(f"- **Deterministic Simulation:** {backends['simulation']}")
+    with col_b2:
+        st.markdown("#### 🛡️ Circuit Breaker Counters")
+        st.write(f"- **Recommendations Emitted:** {counters['recommendations']}")
+        st.write(f"- **Requests Dropped (Tripped / Blocked):** {counters['dropped']}")
+        st.write(f"- **Requests Skipped (No Runbook):** {counters['skipped']}")
+
+    if st.button("🔄 Reset Telemetry Metrics"):
+        pm.reset()
+        st.rerun()

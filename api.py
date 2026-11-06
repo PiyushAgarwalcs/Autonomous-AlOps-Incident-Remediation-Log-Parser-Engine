@@ -14,6 +14,7 @@ from core.llm_client import OllamaClient
 from core.groq_client import GroqClient
 from core.parser import parse_log_line
 from core.vector_store import ChromaRunbooks, load_runbooks
+from core.metrics import PipelineMetrics, timed_stage
 
 app = FastAPI(
     title="AIOps Incident Remediation & Ingestion API",
@@ -30,6 +31,7 @@ breaker = CircuitBreaker()
 vector_store = ChromaRunbooks(persist_dir="./chroma_db", collection_name="sre_runbooks")
 ollama = OllamaClient()
 groq = GroqClient(api_key=os.getenv("GROQ_API_KEY", ""))
+metrics = PipelineMetrics()
 
 
 class LogPayload(BaseModel):
@@ -56,6 +58,19 @@ def health_check():
         "ollama_online": ollama.is_alive(),
         "groq_configured": groq.is_configured(),
     }
+
+
+@app.get("/metrics")
+def get_metrics():
+    """Return pipeline performance metrics snapshot."""
+    return metrics.snapshot()
+
+
+@app.post("/metrics/reset")
+def reset_metrics():
+    """Reset all accumulated pipeline metrics."""
+    metrics.reset()
+    return {"status": "metrics_reset"}
 
 
 @app.post("/ingest")
@@ -121,83 +136,115 @@ def list_incidents(limit: int = 50):
 @app.post("/remediate")
 def remediate_incident(payload: LogPayload):
     """Directly analyze an error and return a validated SRE remediation plan."""
-    event = parse_log_line(payload.model_dump_json())
-    if not event:
-        raise HTTPException(status_code=400, detail="Invalid error event.")
+    with timed_stage("end_to_end") as e2e:
+        with timed_stage("parsing") as t_parse:
+            event = parse_log_line(payload.model_dump_json())
+        if not event:
+            raise HTTPException(status_code=400, detail="Invalid error event.")
 
-    if breaker.is_open:
-        return {
-            "status": "blocked",
-            "reason": f"Circuit breaker is tripped: {breaker.reason}",
-            "human_approval_required": True,
-            "executed": False,
-        }
+        if breaker.is_open:
+            metrics.record_event("dropped", parse_ms=t_parse.duration_ms, e2e_ms=e2e.duration_ms)
+            return {
+                "status": "blocked",
+                "reason": f"Circuit breaker is tripped: {breaker.reason}",
+                "human_approval_required": True,
+                "executed": False,
+            }
 
-    # Retrieve runbook
-    query = f"{event['error_code']} {event['service']} {event['message']}"
-    runbooks = []
-    if RUNBOOKS_FILE.exists():
-        if ollama.is_alive():
-            try:
-                runbooks = vector_store.search(query, ollama, top_k=1)
-            except Exception:
-                runbooks = []
+        # Retrieve runbook
+        query = f"{event['error_code']} {event['service']} {event['message']}"
+        runbooks = []
+        with timed_stage("retrieval") as t_ret:
+            if RUNBOOKS_FILE.exists():
+                if ollama.is_alive():
+                    try:
+                        runbooks = vector_store.search(query, ollama, top_k=1)
+                    except Exception:
+                        runbooks = []
 
-        if not runbooks:
-            raw_runbooks = load_runbooks(RUNBOOKS_FILE)
-            err_code = event.get("error_code", "").upper()
-            msg_lower = event.get("message", "").lower()
-            for rb in raw_runbooks:
-                rb_code = rb.get("error_code", "").upper()
-                if rb_code and rb_code in err_code:
-                    runbooks = [{**rb, "score": 0.95}]
-                    break
-                keywords = [k for k in rb_code.lower().split("_") if len(k) > 2]
-                if any(kw in msg_lower for kw in keywords):
-                    runbooks = [{**rb, "score": 0.91}]
-                    break
+                if not runbooks:
+                    raw_runbooks = load_runbooks(RUNBOOKS_FILE)
+                    err_code = event.get("error_code", "").upper()
+                    msg_lower = event.get("message", "").lower()
+                    for rb in raw_runbooks:
+                        rb_code = rb.get("error_code", "").upper()
+                        if rb_code and rb_code in err_code:
+                            runbooks = [{**rb, "score": 0.95}]
+                            break
+                        keywords = [k for k in rb_code.lower().split("_") if len(k) > 2]
+                        if any(kw in msg_lower for kw in keywords):
+                            runbooks = [{**rb, "score": 0.91}]
+                            break
 
-    if not runbooks:
-        runbooks = [{
-            "id": "generic-incident",
-            "title": "General Service Triage",
-            "text": "Inspect the service logs and check health status before changing settings.",
-        }]
+            if not runbooks:
+                runbooks = [{
+                    "id": "generic-incident",
+                    "title": "General Service Triage",
+                    "text": "Inspect the service logs and check health status before changing settings.",
+                }]
 
-    # Inference (Local Ollama, Groq cloud, or simulation fallback)
-    rec = None
-    if ollama.is_alive():
-        try:
-            rec = ollama.recommend(event, runbooks)
-        except Exception:
-            rec = None
+        # Inference (Local Ollama, Groq cloud, or simulation fallback)
+        rec = None
+        backend_used = "simulation"
+        with timed_stage("inference") as t_inf:
+            if ollama.is_alive():
+                try:
+                    rec = ollama.recommend(event, runbooks)
+                    backend_used = "ollama"
+                except Exception:
+                    rec = None
 
-    if not rec and groq.is_configured():
-        try:
-            rec = groq.recommend(event, runbooks)
-        except Exception:
-            rec = None
+            if not rec and groq.is_configured():
+                try:
+                    rec = groq.recommend(event, runbooks)
+                    backend_used = "groq"
+                except Exception:
+                    rec = None
 
-    if not rec:
-        rec = {
-            "summary": f"Check status of {event['service']} and inspect recent system logs.",
-            "command": f"systemctl status {event['service']}.service",
-            "confidence": 0.93,
-            "confidence_flags": {
-                "diagnosis": True,
-                "runbook_support": True,
-                "command_safety": True,
-            },
-        }
+            if not rec:
+                backend_used = "simulation"
+                rec = {
+                    "summary": f"Check status of {event['service']} and inspect recent system logs.",
+                    "command": f"systemctl status {event['service']}.service",
+                    "confidence": 0.93,
+                    "confidence_flags": {
+                        "diagnosis": True,
+                        "runbook_support": True,
+                        "command_safety": True,
+                    },
+                }
 
-    rejection = breaker.validate(rec)
-    if rejection:
-        return {
-            "status": "dropped",
-            "reason": rejection,
-            "human_approval_required": True,
-            "executed": False,
-        }
+        with timed_stage("guardrail") as t_guard:
+            rejection = breaker.validate(rec)
+
+        if rejection:
+            metrics.record_event(
+                "dropped", backend=backend_used,
+                parse_ms=t_parse.duration_ms, retrieval_ms=t_ret.duration_ms,
+                inference_ms=t_inf.duration_ms, guardrail_ms=t_guard.duration_ms,
+                e2e_ms=e2e.duration_ms,
+            )
+            return {
+                "status": "dropped",
+                "reason": rejection,
+                "human_approval_required": True,
+                "executed": False,
+            }
+
+    latency = {
+        "parsing_ms": round(t_parse.duration_ms, 2),
+        "retrieval_ms": round(t_ret.duration_ms, 2),
+        "inference_ms": round(t_inf.duration_ms, 2),
+        "guardrail_ms": round(t_guard.duration_ms, 2),
+        "end_to_end_ms": round(e2e.duration_ms, 2),
+    }
+
+    metrics.record_event(
+        "recommendation", backend=backend_used,
+        parse_ms=t_parse.duration_ms, retrieval_ms=t_ret.duration_ms,
+        inference_ms=t_inf.duration_ms, guardrail_ms=t_guard.duration_ms,
+        e2e_ms=e2e.duration_ms,
+    )
 
     return {
         "status": "recommendation",
@@ -206,7 +253,9 @@ def remediate_incident(payload: LogPayload):
         "summary": rec["summary"],
         "command": rec["command"],
         "confidence": rec["confidence"],
+        "backend": backend_used,
         "human_approval_required": True,
         "executed": False,
+        "latency": latency,
     }
 

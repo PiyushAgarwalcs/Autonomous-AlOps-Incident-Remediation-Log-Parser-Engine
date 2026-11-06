@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/FastAPI-REST%20API-009688?style=flat&logo=fastapi"/>
   <img src="https://img.shields.io/badge/Streamlit-Dashboard-FF4B4B?style=flat&logo=streamlit"/>
   <img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Tests-20%20Passing-brightgreen?style=flat"/>
+  <img src="https://img.shields.io/badge/Tests-24%20Passing-brightgreen?style=flat"/>
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat"/>
 </p>
 
@@ -90,6 +90,11 @@ Seamlessly falls back across three modes with no code change:
 ### 📋 Persistent Operator Audit Trail
 Every approval and rejection is written to `audit_log.jsonl` and survives page refreshes — giving a full compliance-ready record of operator decisions.
 
+### ⚡ Operational Latency & SLA Performance Telemetry
+- Real-time pipeline performance tracking across each stage: **Log Parsing**, **ChromaDB Vector Retrieval**, **LLM Inference**, and **Guardrail Validation**.
+- Computes min / avg / max / p95 response times and pipeline success rates.
+- Dedicated **Performance Metrics** dashboard tab in Streamlit and `/metrics` REST endpoint in FastAPI for Prometheus/observability integration.
+
 ---
 
 ## 🧰 Tech Stack
@@ -101,10 +106,10 @@ Every approval and rejection is written to `audit_log.jsonl` and survives page r
 | Local LLM | Ollama (`qwen2.5:7b`) | Air-gapped inference |
 | Cloud LLM | Groq (`llama-3.1-8b-instant`) | Low-latency cloud fallback |
 | Embeddings | Ollama (`nomic-embed-text`) | Local text embeddings |
-| Dashboard | Streamlit | SRE operator UI |
-| REST API | FastAPI + Pydantic | External log ingestion webhook |
+| Dashboard | Streamlit | SRE operator UI with 7 interactive tabs |
+| REST API | FastAPI + Pydantic | External log ingestion webhook & `/metrics` |
 | Containerization | Docker | Production deployment |
-| Testing | Python `unittest` + `unittest.mock` | 15 unit tests |
+| Testing | Python `unittest` + `unittest.mock` | 24 unit tests across 8 test suites |
 
 ---
 

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 from aioops_engine import CircuitBreaker, OllamaClient, parse_log_line
 from core.groq_client import GroqClient
+from core.metrics import PipelineMetrics, StageTimer, timed_stage
 from core.parser import follow_file
 from core.vector_store import ChromaRunbooks, cosine_similarity
 from pathlib import Path
@@ -247,6 +248,59 @@ class ApiEndpointTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as ctx:
             api.ingest_log(payload)
         self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_metrics_endpoint_and_remediation_latency(self):
+        import api
+        api.reset_metrics()
+        payload = api.LogPayload(
+            level="ERROR",
+            service="payments-api",
+            error_code="DB_POOL_EXHAUSTED",
+            message="Database pool timeout",
+        )
+        with unittest.mock.patch.object(OllamaClient, "is_alive", return_value=False):
+            res = api.remediate_incident(payload)
+            self.assertEqual(res["status"], "recommendation")
+            self.assertIn("latency", res)
+            self.assertIn("end_to_end_ms", res["latency"])
+            self.assertGreaterEqual(res["latency"]["end_to_end_ms"], 0.0)
+
+            snap = api.get_metrics()
+            self.assertGreaterEqual(snap["counters"]["total_events"], 1)
+            self.assertIn("end_to_end", snap["latency"])
+
+
+class PipelineMetricsTests(unittest.TestCase):
+    def test_stage_timer_records_duration(self):
+        with timed_stage("unit_test") as timer:
+            time.sleep(0.01)
+        self.assertGreater(timer.duration_ms, 0)
+        self.assertEqual(timer.name, "unit_test")
+
+    def test_pipeline_metrics_record_and_snapshot(self):
+        pm = PipelineMetrics()
+        pm.record_event(
+            status="recommendation",
+            backend="ollama",
+            parse_ms=1.2,
+            retrieval_ms=15.0,
+            inference_ms=120.0,
+            guardrail_ms=0.5,
+            e2e_ms=136.7,
+        )
+        snap = pm.snapshot()
+        self.assertEqual(snap["counters"]["total_events"], 1)
+        self.assertEqual(snap["counters"]["recommendations"], 1)
+        self.assertEqual(snap["counters"]["success_rate"], 100.0)
+        self.assertEqual(snap["backend_usage"]["ollama"], 1)
+        self.assertAlmostEqual(snap["latency"]["end_to_end"]["avg_ms"], 136.7, places=1)
+
+    def test_pipeline_metrics_reset(self):
+        pm = PipelineMetrics()
+        pm.record_event(status="dropped", e2e_ms=50.0)
+        self.assertEqual(pm.snapshot()["counters"]["total_events"], 1)
+        pm.reset()
+        self.assertEqual(pm.snapshot()["counters"]["total_events"], 0)
 
 
 if __name__ == "__main__":
